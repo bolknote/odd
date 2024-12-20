@@ -50,9 +50,6 @@ size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_
     size_t left = 0, right = size;
     while (left < right) {
         size_t mid = left + (right - left) / 2;
-        if (mid > odds_size) {
-        	printf("ddd\n");
-        }
 
         if (arr[mid] < v) {
             left = mid + 1;
