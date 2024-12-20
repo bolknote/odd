@@ -1,5 +1,5 @@
-SRC = odds.c
-OUT = odds
+SRC = phase1.c
+OUT = phase1
 
 CC = gcc
 CFLAGS = -Ofast -Wall -Wextra
