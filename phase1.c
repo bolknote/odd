@@ -32,8 +32,8 @@ void printf_u128(const uint128_t v) {
         low  = MASK64(v);
         high = MASK64(v >> 64);
     } else {
-        high = MASK64(v >> 64);
-        low  = MASK64(v);
+        high = MASK64(v);
+        low  = MASK64(v >> 64);
     }
 
     printf("0x%016llX%016llX\n", high, low);
