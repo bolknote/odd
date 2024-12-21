@@ -54,12 +54,12 @@ size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_
     return left;
 }
 
-void realloc_stack(uint128_t **stack, size_t *capacity) {
+void realloc_stack(uint128_t **arr, size_t *capacity) {
     *capacity *= 2;
 
-    *stack = realloc(*stack, *capacity * sizeof(uint128_t));
+    *arr = realloc(*arr, *capacity * sizeof(uint128_t));
 
-    if (*stack == NULL) {
+    if (*arr == NULL) {
         exit(1);
     }
 }
