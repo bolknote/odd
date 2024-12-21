@@ -40,12 +40,6 @@ void printf_u128(const uint128_t v) {
     fflush(stdout);
 }
 
-int compare_uint128_t(const void *a, const void *b) {
-    if (*(uint128_t*) a < *(uint128_t*) b) return -1;
-    if (*(uint128_t*) a > *(uint128_t*) b) return 1;
-    return 0;
-}
-
 size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_t v) {
     size_t left = 0, right = size;
     while (left < right) {
