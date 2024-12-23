@@ -8,22 +8,26 @@
 #define MASK64(v) (uint64_t) ((v) & 0xFFFFFFFFFFFFFFFF)
 #define INITIAL_CAPACITY 1024
 
+#if defined(__BITINT_MAXWIDTH__) && __BITINT_MAXWIDTH__ >= 128
 typedef unsigned _BitInt(128) uint128_t;
+#else
+typedef unsigned __int128 uint128_t;
+#endif
 
-uint128_t* odds = NULL;
-size_t odds_size = 0;
-size_t odds_capacity = 0;
+static uint128_t* odds = NULL;
+static size_t odds_size = 0;
+static size_t odds_capacity = 0;
 
-uint128_t *stack = NULL;
-size_t stack_size = 0;
-size_t stack_capacity = 0;
+static uint128_t *stack = NULL;
+static size_t stack_size = 0;
+static size_t stack_capacity = 0;
 
-uint128_t is_divided_by(uint128_t v, uint_fast8_t by) {
+static uint128_t is_divided_by(uint128_t v, uint_fast8_t by) {
     uint128_t result = v / by;
     return result * by == v ? result : 0;
 }
 
-void printf_u128(const uint128_t v) {
+static void printf_u128(const uint128_t v) {
     uint64_t low, high;
 
     bool is_little_endian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
@@ -37,10 +41,9 @@ void printf_u128(const uint128_t v) {
     }
 
     printf("0x%016llX%016llX\n", high, low);
-    fflush(stdout);
 }
 
-size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_t v) {
+static size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_t v) {
     size_t left = 0, right = size;
     while (left < right) {
         size_t mid = left + (right - left) / 2;
@@ -54,7 +57,7 @@ size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_
     return left;
 }
 
-void realloc_stack(uint128_t **arr, size_t *capacity) {
+static void realloc_stack(uint128_t **arr, size_t *capacity) {
     *capacity *= 2;
 
     *arr = realloc(*arr, *capacity * sizeof(uint128_t));
@@ -64,7 +67,7 @@ void realloc_stack(uint128_t **arr, size_t *capacity) {
     }
 }
 
-bool check_exists_and_add(const uint128_t v) {
+static bool check_exists_and_add(const uint128_t v) {
     size_t pos = 0;
 
     if (odds_size) {
@@ -87,7 +90,7 @@ bool check_exists_and_add(const uint128_t v) {
     return false;
 }
 
-void push_stack(uint128_t value) {
+static void push_stack(uint128_t value) {
     if (stack_size == stack_capacity) {
         realloc_stack(&stack, &stack_capacity);
     }
@@ -95,11 +98,11 @@ void push_stack(uint128_t value) {
     stack[stack_size++] = value;
 }
 
-uint128_t pop_stack() {
+static uint128_t pop_stack(void) {
     return stack[--stack_size];
 }
 
-void main_enumeration(uint128_t counter) {
+static void main_enumeration(uint128_t counter) {
     while (counter != (uint128_t) ~0) {
         if (check_exists_and_add(counter)) {
             return;
