@@ -14,21 +14,39 @@ typedef unsigned _BitInt(128) uint128_t;
 typedef unsigned __int128 uint128_t;
 #endif
 
-static uint128_t* odds = NULL;
-static size_t odds_size = 0;
-static size_t odds_capacity = 0;
+typedef unsigned numeric;
 
-static uint128_t *stack = NULL;
-static size_t stack_size = 0;
-static size_t stack_capacity = 0;
+#define MUL2_ADD1(x) ({ \
+    _Generic((x), \
+        uint128_t: _mul2_add1_u128, \
+        unsigned long long: _mul2_add1_u64, \
+        unsigned: _mul2_add1_u32 \
+    ); \
+})(x)
 
-static uint128_t is_divided_by(uint128_t v, uint_fast8_t by) {
-    uint128_t result = v / by;
-    return result * by == v ? result : 0;
+#define print_u(x) ({ \
+    _Generic((x), \
+        uint128_t: printf_u128, \
+        uint64_t: printf_u64, \
+        uint32_t: printf_u32 \
+    ); \
+})(x)
+
+static inline uint128_t _mul2_add1_u128(uint128_t x) {
+    x = 2 * x + 1;
+    return x == (uint128_t) ~0 ? 0 : x;
+}
+
+static inline unsigned long long _mul2_add1_u64(unsigned long long x) {
+    return __builtin_umulll_overflow(x, 2, &x) || __builtin_uaddll_overflow(x, 1, &x) ? 0 : x;
+}
+
+static inline unsigned long _mul2_add1_u32(unsigned x) {
+    return __builtin_umul_overflow(x, 2, &x) || __builtin_uadd_overflow(x, 1, &x) ? 0 : x;
 }
 
 static void printf_u128(const uint128_t v) {
-    uint64_t low, high;
+    unsigned long long low, high;
 
     bool is_little_endian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
 
@@ -41,9 +59,44 @@ static void printf_u128(const uint128_t v) {
     }
 
     printf("0x%016llX%016llX\n", high, low);
+    fflush(stdout);
 }
 
-static size_t binary_search_insert_position(const uint128_t *arr, size_t size, uint128_t v) {
+static inline void printf_u64(const unsigned long long v) {
+    printf("0x%016llX\n", v);
+    fflush(stdout);
+}
+
+static inline void printf_u32(const unsigned int v) {
+    printf("0x%08X\n", v);
+    fflush(stdout);
+}
+
+
+static numeric* odds = NULL;
+static size_t odds_size = 0;
+static size_t odds_capacity = 0;
+
+static numeric *stack = NULL;
+static size_t stack_size = 0;
+static size_t stack_capacity = 0;
+
+static numeric is_divided_by(numeric v, uint_fast8_t by) {
+    const numeric result = v / by;
+    return result * by == v ? result : 0;
+}
+
+static void realloc_stack(numeric **arr, size_t *capacity) {
+    *capacity *= 2;
+
+    *arr = realloc(*arr, *capacity * sizeof(numeric));
+
+    if (*arr == NULL) {
+        exit(1);
+    }
+}
+
+static size_t binary_search_insert_position(const numeric *arr, size_t size, numeric v) {
     size_t left = 0, right = size;
     while (left < right) {
         size_t mid = left + (right - left) / 2;
@@ -57,17 +110,7 @@ static size_t binary_search_insert_position(const uint128_t *arr, size_t size, u
     return left;
 }
 
-static void realloc_stack(uint128_t **arr, size_t *capacity) {
-    *capacity *= 2;
-
-    *arr = realloc(*arr, *capacity * sizeof(uint128_t));
-
-    if (*arr == NULL) {
-        exit(1);
-    }
-}
-
-static bool check_exists_and_add(const uint128_t v) {
+static bool check_exists_and_add(const numeric v) {
     size_t pos = 0;
 
     if (odds_size) {
@@ -78,11 +121,11 @@ static bool check_exists_and_add(const uint128_t v) {
         }
     }
 
-    if (odds_size == odds_capacity) {
+    if (odds_size + 1 >= odds_capacity) {
         realloc_stack(&odds, &odds_capacity);
     }
 
-    memmove(&odds[pos + 1], &odds[pos], (odds_size - pos) * sizeof(uint128_t));
+    memmove(&odds[pos + 1], &odds[pos], (odds_size - pos) * sizeof(numeric));
 
     odds[pos] = v;
     odds_size++;
@@ -90,27 +133,27 @@ static bool check_exists_and_add(const uint128_t v) {
     return false;
 }
 
-static void push_stack(uint128_t value) {
+static void push_stack(numeric value) {
+    stack[stack_size++] = value;
+
     if (stack_size == stack_capacity) {
         realloc_stack(&stack, &stack_capacity);
     }
-
-    stack[stack_size++] = value;
 }
 
-static uint128_t pop_stack(void) {
+static inline numeric pop_stack(void) {
     return stack[--stack_size];
 }
 
-static void main_enumeration(uint128_t counter) {
-    while (counter != (uint128_t) ~0) {
+static void main_enumeration(numeric counter) {
+    do {
         if (check_exists_and_add(counter)) {
             return;
         }
 
-        printf_u128(counter);
+        print_u(counter);
 
-        uint128_t cnt_by_3 = is_divided_by(counter, 3);
+        numeric cnt_by_3 = is_divided_by(counter, 3);
 
         if (cnt_by_3) {
             do {
@@ -118,28 +161,30 @@ static void main_enumeration(uint128_t counter) {
                     break;
                 }
 
-                printf_u128(cnt_by_3);
+                print_u(cnt_by_3);
                 cnt_by_3 = is_divided_by(cnt_by_3, 3);
 
                 if (cnt_by_3) {
-                    push_stack(cnt_by_3 * 2 + 1);
+                    numeric next = MUL2_ADD1(cnt_by_3);
+                    if (next > 0) {
+                        push_stack(next);
+                    }
                 }
             } while (cnt_by_3);
         }
 
-        counter = 2 * counter + 1;
-    }
+        counter = MUL2_ADD1(counter);
+    } while (counter);
 }
 
 int main(void) {
     odds_capacity = INITIAL_CAPACITY;
-    odds = malloc(odds_capacity * sizeof(uint128_t));
+    odds = malloc(odds_capacity * sizeof(numeric));
 
     stack_capacity = INITIAL_CAPACITY;
-    stack = malloc(stack_capacity * sizeof(uint128_t));
+    stack = malloc(stack_capacity * sizeof(numeric));
 
     push_stack(1);
-
     while (stack_size > 0) {
         main_enumeration(pop_stack());
     }
