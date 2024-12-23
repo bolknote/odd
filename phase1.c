@@ -17,33 +17,17 @@ typedef unsigned __int128 uint128_t;
 typedef unsigned numeric;
 
 #define MUL2_ADD1(x) ({ \
-    _Generic((x), \
-        uint128_t: _mul2_add1_u128, \
-        unsigned long long: _mul2_add1_u64, \
-        unsigned: _mul2_add1_u32 \
-    ); \
-})(x)
+    typeof(x) y; \
+    __builtin_mul_overflow(x, 2, &y) || __builtin_add_overflow(y, 1, &y) ? 0 : y; \
+})
 
-#define print_u(x) ({ \
+#define PRINT_U(x) ({ \
     _Generic((x), \
         uint128_t: printf_u128, \
         uint64_t: printf_u64, \
         uint32_t: printf_u32 \
     ); \
 })(x)
-
-static inline uint128_t _mul2_add1_u128(uint128_t x) {
-    x = 2 * x + 1;
-    return x == (uint128_t) ~0 ? 0 : x;
-}
-
-static inline unsigned long long _mul2_add1_u64(unsigned long long x) {
-    return __builtin_umulll_overflow(x, 2, &x) || __builtin_uaddll_overflow(x, 1, &x) ? 0 : x;
-}
-
-static inline unsigned long _mul2_add1_u32(unsigned x) {
-    return __builtin_umul_overflow(x, 2, &x) || __builtin_uadd_overflow(x, 1, &x) ? 0 : x;
-}
 
 static void printf_u128(const uint128_t v) {
     unsigned long long low, high;
@@ -151,7 +135,7 @@ static void main_enumeration(numeric counter) {
             return;
         }
 
-        print_u(counter);
+        PRINT_U(counter);
 
         numeric cnt_by_3 = is_divided_by(counter, 3);
 
@@ -161,7 +145,7 @@ static void main_enumeration(numeric counter) {
                     break;
                 }
 
-                print_u(cnt_by_3);
+                PRINT_U(cnt_by_3);
                 cnt_by_3 = is_divided_by(cnt_by_3, 3);
 
                 if (cnt_by_3) {
