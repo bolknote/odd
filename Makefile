@@ -1,13 +1,13 @@
-SRC = phase1.c
-OUT = phase1
-
 CC = gcc
 CFLAGS = -Ofast -Wall -Wextra
 
-all: $(OUT)
+all: phase1 phase2
 
-$(OUT): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $(OUT)
+phase1: phase1.c
+	$(CC) $(CFLAGS) -o phase1 phase1.c
+
+phase2: phase2.c
+	$(CC) $(CFLAGS) -o phase2 phase2.c
 
 clean:
-	rm -f $(OUT)
+	rm -f phase1 phase2
