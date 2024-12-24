@@ -10,7 +10,7 @@
 #include <sys/sysctl.h>
 
 #define MASK64(v) (uint64_t) ((v) & 0xFFFFFFFFFFFFFFFF)
-#define INITIAL_CAPACITY 1024
+#define INITIAL_CAPACITY 0xA00000
 
 #if defined(__BITINT_MAXWIDTH__) && __BITINT_MAXWIDTH__ >= 128
 typedef unsigned _BitInt(128) uint128_t;
@@ -69,7 +69,7 @@ static size_t stack_size = 0;
 static size_t stack_capacity = 0;
 
 static pthread_mutex_t stack_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t odds_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t odds_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_cond_t stack_condition = PTHREAD_COND_INITIALIZER;
 
 static atomic_int threads_count = 0;
@@ -107,16 +107,19 @@ static size_t binary_search_insert_position(const numeric *arr, size_t size, num
 static bool check_exists_and_add(const numeric v) {
     size_t pos = 0;
 
-    pthread_mutex_lock(&odds_mutex);
+    pthread_rwlock_rdlock(&odds_rwlock);
 
     if (odds_size) {
         pos = binary_search_insert_position(odds, odds_size, v);
 
         if (pos < odds_size && odds[pos] == v) {
-            pthread_mutex_unlock(&odds_mutex);
+            pthread_rwlock_unlock(&odds_rwlock);
             return true;
         }
     }
+
+    pthread_rwlock_unlock(&odds_rwlock);
+    pthread_rwlock_wrlock(&odds_rwlock);
 
     if (odds_size + 1 >= odds_capacity) {
         realloc_stack(&odds, &odds_capacity);
@@ -127,7 +130,7 @@ static bool check_exists_and_add(const numeric v) {
     odds[pos] = v;
     odds_size++;
 
-    pthread_mutex_unlock(&odds_mutex);
+    pthread_rwlock_unlock(&odds_rwlock);
     return false;
 }
 
