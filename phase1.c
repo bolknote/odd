@@ -14,7 +14,7 @@ typedef unsigned _BitInt(128) uint128_t;
 typedef unsigned __int128 uint128_t;
 #endif
 
-typedef unsigned numeric;
+typedef uint16_t numeric;
 
 #define MUL2_ADD1(x) ({ \
     typeof(x) y; \
@@ -25,7 +25,8 @@ typedef unsigned numeric;
     _Generic((x), \
         uint128_t: printf_u128, \
         uint64_t: printf_u64, \
-        uint32_t: printf_u32 \
+        uint32_t: printf_u32, \
+        uint16_t: printf_u32 \
     ); \
 })(x)
 
