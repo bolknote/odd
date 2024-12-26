@@ -37,15 +37,13 @@ typedef uint16_t numeric;
 static void printf_u128(const uint128_t v) {
     unsigned long long low, high;
 
-    bool is_little_endian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
-
-    if (is_little_endian) {
+    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         low  = MASK64(v);
         high = MASK64(v >> 64);
-    } else {
+    #else
         high = MASK64(v);
         low  = MASK64(v >> 64);
-    }
+    #endif
 
     printf("0x%016llX%016llX\n", high, low);
     fflush(stdout);
