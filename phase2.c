@@ -18,7 +18,7 @@ typedef unsigned _BitInt(128) uint128_t;
 typedef unsigned __int128 uint128_t;
 #endif
 
-typedef uint16_t numeric;
+typedef uint32_t numeric;
 
 #define MUL2_ADD1(x) ({ \
     typeof(x) y; \
@@ -59,19 +59,25 @@ static inline void printf_u32(const unsigned int v) {
     fflush(stdout);
 }
 
-static numeric* odds = NULL;
-static size_t odds_size = 0;
-static size_t odds_capacity = 0;
+#define HASH_SIZE 8192
+
+typedef struct {
+    numeric* array;
+    size_t size;
+    size_t capacity;
+    pthread_rwlock_t lock;
+} HashBucket;
+
+static HashBucket* hash_table = NULL;
 
 static numeric *stack = NULL;
 static size_t stack_size = 0;
 static size_t stack_capacity = 0;
 
 static pthread_mutex_t stack_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_rwlock_t odds_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_cond_t stack_condition = PTHREAD_COND_INITIALIZER;
 
-static atomic_int threads_count = 0;
+static atomic_int active_workers = 0;
 static atomic_bool running = true;
 
 static numeric is_divided_by(numeric v, uint_fast8_t by) {
@@ -81,11 +87,20 @@ static numeric is_divided_by(numeric v, uint_fast8_t by) {
 
 static void realloc_stack(numeric **arr, size_t *capacity) {
     *capacity *= 2;
-
     *arr = realloc(*arr, *capacity * sizeof(numeric));
+    if (*arr == NULL) exit(1);
+}
 
-    if (*arr == NULL) {
-        exit(1);
+static inline size_t hash(numeric key) {
+    return key % HASH_SIZE;
+}
+
+static void init_hash_table() {
+    hash_table = calloc(HASH_SIZE, sizeof(HashBucket));
+    for (size_t i = 0; i < HASH_SIZE; i++) {
+        hash_table[i].capacity = INITIAL_CAPACITY / HASH_SIZE;
+        hash_table[i].array = malloc(hash_table[i].capacity * sizeof(numeric));
+        pthread_rwlock_init(&hash_table[i].lock, NULL);
     }
 }
 
@@ -103,105 +118,101 @@ static size_t binary_search_insert_position(const numeric *arr, size_t size, num
     return left;
 }
 
-static bool check_exists_and_add(const numeric v) {
-    size_t pos = 0;
+static bool check_exists_and_add(numeric v) {
+    size_t bucket_idx = hash(v);
+    HashBucket* bucket = &hash_table[bucket_idx];
 
-    pthread_rwlock_rdlock(&odds_rwlock);
+    pthread_rwlock_rdlock(&bucket->lock);
+    size_t pos = binary_search_insert_position(bucket->array, bucket->size, v);
+    bool exists = pos < bucket->size && bucket->array[pos] == v;
+    pthread_rwlock_unlock(&bucket->lock);
 
-    if (odds_size) {
-        pos = binary_search_insert_position(odds, odds_size, v);
+    if (exists) return true;
 
-        if (pos < odds_size && odds[pos] == v) {
-            pthread_rwlock_unlock(&odds_rwlock);
-            return true;
-        }
+    pthread_rwlock_wrlock(&bucket->lock);
+    pos = binary_search_insert_position(bucket->array, bucket->size, v);
+    if (pos < bucket->size && bucket->array[pos] == v) {
+        pthread_rwlock_unlock(&bucket->lock);
+        return true;
     }
 
-    pthread_rwlock_unlock(&odds_rwlock);
-    pthread_rwlock_wrlock(&odds_rwlock);
-
-    if (odds_size + 1 >= odds_capacity) {
-        realloc_stack(&odds, &odds_capacity);
+    if (bucket->size + 1 >= bucket->capacity) {
+        bucket->capacity *= 2;
+        bucket->array = realloc(bucket->array, bucket->capacity * sizeof(numeric));
     }
 
-    memmove(&odds[pos + 1], &odds[pos], (odds_size - pos) * sizeof(numeric));
-
-    odds[pos] = v;
-    odds_size++;
-
-    pthread_rwlock_unlock(&odds_rwlock);
+    memmove(&bucket->array[pos + 1], &bucket->array[pos], 
+            (bucket->size - pos) * sizeof(numeric));
+    bucket->array[pos] = v;
+    bucket->size++;
+    pthread_rwlock_unlock(&bucket->lock);
     return false;
 }
 
 static void push_stack(numeric value) {
     pthread_mutex_lock(&stack_mutex);
-
-    stack[stack_size++] = value;
-
     if (stack_size == stack_capacity) {
         realloc_stack(&stack, &stack_capacity);
     }
-
+    stack[stack_size++] = value;
     pthread_cond_signal(&stack_condition);
-
     pthread_mutex_unlock(&stack_mutex);
-}
-
-static inline numeric pop_stack(void) {
-    pthread_mutex_lock(&stack_mutex);
-
-    while (stack_size == 0) {
-        pthread_cond_wait(&stack_condition, &stack_mutex);
-    }
-
-    numeric value = stack[--stack_size];
-
-    pthread_mutex_unlock(&stack_mutex);
-    return value;
 }
 
 static void main_enumeration(numeric counter) {
     do {
-        if (check_exists_and_add(counter)) {
-            return;
-        }
-
+        if (check_exists_and_add(counter)) return;
         PRINT_U(counter);
 
         numeric cnt_by_3 = is_divided_by(counter, 3);
-
         if (cnt_by_3) {
             do {
-                if (check_exists_and_add(cnt_by_3)) {
-                    break;
-                }
-
+                if (check_exists_and_add(cnt_by_3)) break;
                 PRINT_U(cnt_by_3);
                 cnt_by_3 = is_divided_by(cnt_by_3, 3);
-
                 if (cnt_by_3) {
                     numeric next = MUL2_ADD1(cnt_by_3);
-                    if (next > 0) {
-                        push_stack(next);
-                    }
+                    if (next) push_stack(next);
                 }
             } while (cnt_by_3);
         }
-
         counter = MUL2_ADD1(counter);
     } while (counter);
 }
 
-void* worker() {
+void* worker(void* arg) {
+    (void)arg;
     while (atomic_load(&running)) {
-        if (stack_size > 0) {
-            numeric item = pop_stack();
-            main_enumeration(item);
-        } else {
-            pthread_mutex_lock(&stack_mutex);
+        pthread_mutex_lock(&stack_mutex);
+        while (stack_size == 0 && atomic_load(&running)) {
+            if (atomic_load(&active_workers) == 0) {
+                atomic_store(&running, false);
+                pthread_cond_broadcast(&stack_condition);
+                pthread_mutex_unlock(&stack_mutex);
+                return NULL;
+            }
             pthread_cond_wait(&stack_condition, &stack_mutex);
-            pthread_mutex_unlock(&stack_mutex);
         }
+
+        if (!atomic_load(&running)) {
+            pthread_mutex_unlock(&stack_mutex);
+            break;
+        }
+
+        numeric item = stack[--stack_size];
+        atomic_fetch_add(&active_workers, 1);
+        pthread_mutex_unlock(&stack_mutex);
+
+        main_enumeration(item);
+
+        atomic_fetch_sub(&active_workers, 1);
+
+        pthread_mutex_lock(&stack_mutex);
+        if (stack_size == 0 && atomic_load(&active_workers) == 0) {
+            atomic_store(&running, false);
+            pthread_cond_broadcast(&stack_condition);
+        }
+        pthread_mutex_unlock(&stack_mutex);
     }
     return NULL;
 }
@@ -230,14 +241,11 @@ int get_num_threads_from_args(int argc, char* argv[]) {
     return num_cores;
 }
 
-
 int main(int argc, char* argv[]) {
-    odds_capacity = INITIAL_CAPACITY;
-    odds = malloc(odds_capacity * sizeof(numeric));
+    init_hash_table();
 
     stack_capacity = INITIAL_CAPACITY;
     stack = malloc(stack_capacity * sizeof(numeric));
-
     push_stack(1);
 
     const int max_threads = get_num_threads_from_args(argc, argv);
@@ -245,17 +253,18 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < max_threads; i++) {
         pthread_create(&threads[i], NULL, worker, NULL);
-        atomic_fetch_add(&threads_count, 1);
     }
 
     for (int i = 0; i < max_threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    atomic_store(&running, false);
-
+    for (size_t i = 0; i < HASH_SIZE; i++) {
+        free(hash_table[i].array);
+        pthread_rwlock_destroy(&hash_table[i].lock);
+    }
+    free(hash_table);
     free(stack);
-    free(odds);
 
     return 0;
 }
