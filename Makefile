@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Ofast -Wall -Wextra
+CFLAGS = -Wall -Wextra -O3 -ffast-math
 
 all: phase1 phase2
 
