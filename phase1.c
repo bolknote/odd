@@ -1,34 +1,14 @@
-#include <string.h>
-
 #include "common.h"
 
 #define INITIAL_CAPACITY 1024
 
-static numeric *odds = NULL;
-static size_t odds_size = 0;
-static size_t odds_capacity = 0;
-
 static numeric *stack = NULL;
 static size_t stack_size = 0;
 static size_t stack_capacity = 0;
+static VisitedSet visited;
 
 static bool check_exists_and_add(const numeric v) {
-    const size_t pos = binary_search_insert_position(odds, odds_size, v);
-
-    if (pos < odds_size && odds[pos] == v) {
-        return true;
-    }
-
-    if (odds_size + 1 >= odds_capacity) {
-        grow_numeric_array(&odds, &odds_capacity);
-    }
-
-    memmove(&odds[pos + 1], &odds[pos], (odds_size - pos) * sizeof(numeric));
-
-    odds[pos] = v;
-    odds_size++;
-
-    return false;
+    return visited_check_and_add(&visited, v);
 }
 
 static void push_stack(numeric value) {
@@ -64,9 +44,7 @@ static void process_value(numeric value) {
 
 int main(void) {
     configure_stdout();
-
-    odds_capacity = INITIAL_CAPACITY;
-    odds = checked_malloc_array(odds_capacity, sizeof(*odds));
+    visited_init(&visited);
 
     stack_capacity = INITIAL_CAPACITY;
     stack = checked_malloc_array(stack_capacity, sizeof(*stack));
@@ -82,7 +60,7 @@ int main(void) {
     }
 
     free(stack);
-    free(odds);
+    visited_destroy(&visited);
 
     return 0;
 }

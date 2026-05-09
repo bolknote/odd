@@ -7,27 +7,46 @@
 
 #include "common.h"
 
-#define INITIAL_CAPACITY 0xA00000
-#define HASH_SIZE 8192
+#define QUEUE_INITIAL_CAPACITY 1024
 #define MAX_THREADS 1024
 
 typedef struct {
-    numeric *array;
+    numeric *items;
     size_t size;
     size_t capacity;
-    pthread_rwlock_t lock;
-} HashBucket;
+    pthread_mutex_t lock;
+} WorkQueue;
 
-static HashBucket *hash_table = NULL;
+typedef struct ConcurrentBitsetPage {
+    numeric page_id;
+    _Atomic uint64_t words[BITSET_PAGE_WORDS];
+    struct ConcurrentBitsetPage *next;
+} ConcurrentBitsetPage;
 
-static numeric *stack = NULL;
-static size_t stack_size = 0;
-static size_t stack_capacity = 0;
+typedef struct {
+    pthread_mutex_t lock;
+    ConcurrentBitsetPage *pages;
+} SparseBucket;
 
-static pthread_mutex_t stack_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t stack_condition = PTHREAD_COND_INITIALIZER;
+typedef struct {
+    bool dense;
+    _Atomic uint64_t *dense_words;
+    size_t dense_word_count;
+    SparseBucket *sparse_buckets;
+} ConcurrentVisitedSet;
 
-static atomic_int active_workers = 0;
+typedef struct {
+    int id;
+} WorkerContext;
+
+static ConcurrentVisitedSet visited;
+static WorkQueue *queues = NULL;
+static int queue_count = 0;
+
+static pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t work_condition = PTHREAD_COND_INITIALIZER;
+
+static atomic_size_t outstanding_work = 0;
 static atomic_bool running = true;
 
 static void die_pthread(int error, const char *message) {
@@ -35,171 +54,252 @@ static void die_pthread(int error, const char *message) {
     die_errno(message);
 }
 
-static inline size_t hash(numeric key) {
-    return (size_t)((key >> 1) % HASH_SIZE);
+static void lock_mutex(pthread_mutex_t *mutex, const char *message) {
+    const int error = pthread_mutex_lock(mutex);
+    if (error != 0) {
+        die_pthread(error, message);
+    }
 }
 
-static void init_hash_table(void) {
-    hash_table = checked_calloc_array(HASH_SIZE, sizeof(*hash_table));
+static void unlock_mutex(pthread_mutex_t *mutex, const char *message) {
+    const int error = pthread_mutex_unlock(mutex);
+    if (error != 0) {
+        die_pthread(error, message);
+    }
+}
 
-    for (size_t i = 0; i < HASH_SIZE; i++) {
-        hash_table[i].capacity = INITIAL_CAPACITY / HASH_SIZE;
-        hash_table[i].array = checked_malloc_array(hash_table[i].capacity, sizeof(*hash_table[i].array));
+static void concurrent_visited_init(ConcurrentVisitedSet *set) {
+    set->dense = NUMERIC_BITS <= DENSE_BITSET_MAX_BITS;
+    set->dense_words = NULL;
+    set->dense_word_count = 0;
+    set->sparse_buckets = NULL;
 
-        const int error = pthread_rwlock_init(&hash_table[i].lock, NULL);
+    if (set->dense) {
+        const uint128_t odd_values = ((uint128_t)1) << (NUMERIC_BITS - 1);
+        set->dense_word_count = (size_t)((odd_values + BITSET_WORD_BITS - 1) / BITSET_WORD_BITS);
+        set->dense_words = checked_calloc_array(set->dense_word_count, sizeof(*set->dense_words));
+        return;
+    }
+
+    set->sparse_buckets = checked_calloc_array(SPARSE_BUCKET_COUNT, sizeof(*set->sparse_buckets));
+    for (size_t i = 0; i < SPARSE_BUCKET_COUNT; i++) {
+        const int error = pthread_mutex_init(&set->sparse_buckets[i].lock, NULL);
         if (error != 0) {
-            die_pthread(error, "pthread_rwlock_init");
+            die_pthread(error, "pthread_mutex_init");
         }
     }
+}
+
+static void concurrent_visited_destroy(ConcurrentVisitedSet *set) {
+    free(set->dense_words);
+
+    if (set->sparse_buckets != NULL) {
+        for (size_t i = 0; i < SPARSE_BUCKET_COUNT; i++) {
+            ConcurrentBitsetPage *page = set->sparse_buckets[i].pages;
+
+            while (page != NULL) {
+                ConcurrentBitsetPage *next = page->next;
+                free(page);
+                page = next;
+            }
+
+            const int error = pthread_mutex_destroy(&set->sparse_buckets[i].lock);
+            if (error != 0) {
+                die_pthread(error, "pthread_mutex_destroy");
+            }
+        }
+
+        free(set->sparse_buckets);
+    }
+
+    set->dense_words = NULL;
+    set->dense_word_count = 0;
+    set->sparse_buckets = NULL;
+}
+
+static bool concurrent_visited_check_and_add(ConcurrentVisitedSet *set, numeric value) {
+    const numeric odd_index = (numeric)(value >> 1);
+
+    if (set->dense) {
+        const size_t bit_index = (size_t)odd_index;
+        const size_t word_index = bit_index / BITSET_WORD_BITS;
+        const uint64_t mask = UINT64_C(1) << (bit_index % BITSET_WORD_BITS);
+        const uint64_t previous = atomic_fetch_or(&set->dense_words[word_index], mask);
+
+        return (previous & mask) != 0;
+    }
+
+    const numeric page_id = (numeric)(odd_index >> BITSET_PAGE_BITS);
+    const unsigned page_offset = (unsigned)(odd_index & (numeric)(BITSET_PAGE_VALUES - 1));
+    const size_t bucket_index = (size_t)(hash_numeric(page_id) % SPARSE_BUCKET_COUNT);
+    SparseBucket *bucket = &set->sparse_buckets[bucket_index];
+
+    lock_mutex(&bucket->lock, "pthread_mutex_lock");
+    ConcurrentBitsetPage *page = bucket->pages;
+
+    while (page != NULL && page->page_id != page_id) {
+        page = page->next;
+    }
+
+    if (page == NULL) {
+        page = checked_calloc_array(1, sizeof(*page));
+        page->page_id = page_id;
+        page->next = bucket->pages;
+        bucket->pages = page;
+    }
+
+    unlock_mutex(&bucket->lock, "pthread_mutex_unlock");
+
+    const size_t word_index = page_offset / BITSET_WORD_BITS;
+    const uint64_t mask = UINT64_C(1) << (page_offset % BITSET_WORD_BITS);
+    const uint64_t previous = atomic_fetch_or(&page->words[word_index], mask);
+
+    return (previous & mask) != 0;
 }
 
 static bool check_exists_and_add(numeric v) {
-    const size_t bucket_idx = hash(v);
-    HashBucket *bucket = &hash_table[bucket_idx];
-
-    int error = pthread_rwlock_rdlock(&bucket->lock);
-    if (error != 0) {
-        die_pthread(error, "pthread_rwlock_rdlock");
-    }
-    size_t pos = binary_search_insert_position(bucket->array, bucket->size, v);
-    const bool exists = pos < bucket->size && bucket->array[pos] == v;
-    error = pthread_rwlock_unlock(&bucket->lock);
-    if (error != 0) {
-        die_pthread(error, "pthread_rwlock_unlock");
-    }
-
-    if (exists) {
-        return true;
-    }
-
-    error = pthread_rwlock_wrlock(&bucket->lock);
-    if (error != 0) {
-        die_pthread(error, "pthread_rwlock_wrlock");
-    }
-    pos = binary_search_insert_position(bucket->array, bucket->size, v);
-    if (pos < bucket->size && bucket->array[pos] == v) {
-        error = pthread_rwlock_unlock(&bucket->lock);
-        if (error != 0) {
-            die_pthread(error, "pthread_rwlock_unlock");
-        }
-        return true;
-    }
-
-    if (bucket->size + 1 >= bucket->capacity) {
-        grow_numeric_array(&bucket->array, &bucket->capacity);
-    }
-
-    memmove(&bucket->array[pos + 1], &bucket->array[pos],
-            (bucket->size - pos) * sizeof(numeric));
-    bucket->array[pos] = v;
-    bucket->size++;
-
-    error = pthread_rwlock_unlock(&bucket->lock);
-    if (error != 0) {
-        die_pthread(error, "pthread_rwlock_unlock");
-    }
-    return false;
+    return concurrent_visited_check_and_add(&visited, v);
 }
 
-static void push_stack(numeric value) {
-    int error = pthread_mutex_lock(&stack_mutex);
+static void queue_init(WorkQueue *queue) {
+    queue->capacity = QUEUE_INITIAL_CAPACITY;
+    queue->size = 0;
+    queue->items = checked_malloc_array(queue->capacity, sizeof(*queue->items));
+
+    const int error = pthread_mutex_init(&queue->lock, NULL);
     if (error != 0) {
-        die_pthread(error, "pthread_mutex_lock");
+        die_pthread(error, "pthread_mutex_init");
     }
-    if (stack_size == stack_capacity) {
-        grow_numeric_array(&stack, &stack_capacity);
+}
+
+static void queue_destroy(WorkQueue *queue) {
+    free(queue->items);
+
+    const int error = pthread_mutex_destroy(&queue->lock);
+    if (error != 0) {
+        die_pthread(error, "pthread_mutex_destroy");
     }
-    stack[stack_size++] = value;
-    error = pthread_cond_signal(&stack_condition);
+}
+
+static void queue_push(WorkQueue *queue, numeric value) {
+    lock_mutex(&queue->lock, "pthread_mutex_lock");
+
+    if (queue->size == queue->capacity) {
+        grow_numeric_array(&queue->items, &queue->capacity);
+    }
+
+    queue->items[queue->size++] = value;
+    unlock_mutex(&queue->lock, "pthread_mutex_unlock");
+}
+
+static bool queue_pop(WorkQueue *queue, numeric *value) {
+    bool found = false;
+
+    lock_mutex(&queue->lock, "pthread_mutex_lock");
+    if (queue->size > 0) {
+        *value = queue->items[--queue->size];
+        found = true;
+    }
+    unlock_mutex(&queue->lock, "pthread_mutex_unlock");
+
+    return found;
+}
+
+static void signal_work_available(void) {
+    lock_mutex(&work_mutex, "pthread_mutex_lock");
+    const int error = pthread_cond_signal(&work_condition);
     if (error != 0) {
         die_pthread(error, "pthread_cond_signal");
     }
-    error = pthread_mutex_unlock(&stack_mutex);
-    if (error != 0) {
-        die_pthread(error, "pthread_mutex_unlock");
-    }
+    unlock_mutex(&work_mutex, "pthread_mutex_unlock");
 }
 
-static void add_next(numeric value) {
+static void push_work(int queue_id, numeric value) {
+    atomic_fetch_add(&outstanding_work, 1);
+    queue_push(&queues[queue_id], value);
+    signal_work_available();
+}
+
+static void add_next(int worker_id, numeric value) {
     if (!check_exists_and_add(value)) {
         PRINT_U(value);
-        push_stack(value);
+        push_work(worker_id, value);
     }
 }
 
-static void process_value(numeric value) {
+static void process_value(int worker_id, numeric value) {
     numeric next;
     if (mul2_add1(value, &next)) {
-        add_next(next);
+        add_next(worker_id, next);
     }
 
     numeric divided;
     if (divide_exact(value, 3, &divided)) {
-        add_next(divided);
+        add_next(worker_id, divided);
+    }
+}
+
+static bool try_get_work(int worker_id, numeric *item) {
+    if (queue_pop(&queues[worker_id], item)) {
+        return true;
+    }
+
+    for (int offset = 1; offset < queue_count; offset++) {
+        const int victim_id = (worker_id + offset) % queue_count;
+
+        if (queue_pop(&queues[victim_id], item)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool wait_for_work(int worker_id, numeric *item) {
+    if (try_get_work(worker_id, item)) {
+        return true;
+    }
+
+    lock_mutex(&work_mutex, "pthread_mutex_lock");
+    while (atomic_load(&running)) {
+        if (try_get_work(worker_id, item)) {
+            unlock_mutex(&work_mutex, "pthread_mutex_unlock");
+            return true;
+        }
+
+        const int error = pthread_cond_wait(&work_condition, &work_mutex);
+        if (error != 0) {
+            die_pthread(error, "pthread_cond_wait");
+        }
+    }
+    unlock_mutex(&work_mutex, "pthread_mutex_unlock");
+
+    return false;
+}
+
+static void finish_work_item(void) {
+    if (atomic_fetch_sub(&outstanding_work, 1) == 1) {
+        atomic_store(&running, false);
+
+        lock_mutex(&work_mutex, "pthread_mutex_lock");
+        const int error = pthread_cond_broadcast(&work_condition);
+        if (error != 0) {
+            die_pthread(error, "pthread_cond_broadcast");
+        }
+        unlock_mutex(&work_mutex, "pthread_mutex_unlock");
     }
 }
 
 static void *worker(void *arg) {
-    (void)arg;
-    while (atomic_load(&running)) {
-        int error = pthread_mutex_lock(&stack_mutex);
-        if (error != 0) {
-            die_pthread(error, "pthread_mutex_lock");
-        }
-        while (stack_size == 0 && atomic_load(&running)) {
-            if (atomic_load(&active_workers) == 0) {
-                atomic_store(&running, false);
-                error = pthread_cond_broadcast(&stack_condition);
-                if (error != 0) {
-                    die_pthread(error, "pthread_cond_broadcast");
-                }
-                error = pthread_mutex_unlock(&stack_mutex);
-                if (error != 0) {
-                    die_pthread(error, "pthread_mutex_unlock");
-                }
-                return NULL;
-            }
-            error = pthread_cond_wait(&stack_condition, &stack_mutex);
-            if (error != 0) {
-                die_pthread(error, "pthread_cond_wait");
-            }
-        }
+    const WorkerContext *context = arg;
+    const int worker_id = context->id;
+    numeric item;
 
-        if (!atomic_load(&running)) {
-            error = pthread_mutex_unlock(&stack_mutex);
-            if (error != 0) {
-                die_pthread(error, "pthread_mutex_unlock");
-            }
-            break;
-        }
-
-        const numeric item = stack[--stack_size];
-        atomic_fetch_add(&active_workers, 1);
-        error = pthread_mutex_unlock(&stack_mutex);
-        if (error != 0) {
-            die_pthread(error, "pthread_mutex_unlock");
-        }
-
-        process_value(item);
-
-        atomic_fetch_sub(&active_workers, 1);
-
-        error = pthread_mutex_lock(&stack_mutex);
-        if (error != 0) {
-            die_pthread(error, "pthread_mutex_lock");
-        }
-        if (stack_size == 0 && atomic_load(&active_workers) == 0) {
-            atomic_store(&running, false);
-            error = pthread_cond_broadcast(&stack_condition);
-            if (error != 0) {
-                die_pthread(error, "pthread_cond_broadcast");
-            }
-        }
-        error = pthread_mutex_unlock(&stack_mutex);
-        if (error != 0) {
-            die_pthread(error, "pthread_mutex_unlock");
-        }
+    while (wait_for_work(worker_id, &item)) {
+        process_value(worker_id, item);
+        finish_work_item();
     }
+
     return NULL;
 }
 
@@ -225,41 +325,40 @@ static int get_num_threads_from_args(int argc, char *argv[]) {
 }
 
 static void stop_workers(void) {
-    int error = pthread_mutex_lock(&stack_mutex);
-    if (error != 0) {
-        die_pthread(error, "pthread_mutex_lock");
-    }
-
     atomic_store(&running, false);
-    error = pthread_cond_broadcast(&stack_condition);
+
+    lock_mutex(&work_mutex, "pthread_mutex_lock");
+    const int error = pthread_cond_broadcast(&work_condition);
     if (error != 0) {
         die_pthread(error, "pthread_cond_broadcast");
     }
-
-    error = pthread_mutex_unlock(&stack_mutex);
-    if (error != 0) {
-        die_pthread(error, "pthread_mutex_unlock");
-    }
+    unlock_mutex(&work_mutex, "pthread_mutex_unlock");
 }
 
 int main(int argc, char *argv[]) {
     configure_stdout();
-    init_hash_table();
+    concurrent_visited_init(&visited);
 
-    stack_capacity = INITIAL_CAPACITY;
-    stack = checked_malloc_array(stack_capacity, sizeof(*stack));
+    const int max_threads = get_num_threads_from_args(argc, argv);
+    queue_count = max_threads;
+    queues = checked_malloc_array((size_t)queue_count, sizeof(*queues));
+    for (int i = 0; i < queue_count; i++) {
+        queue_init(&queues[i]);
+    }
+
+    pthread_t *threads = checked_malloc_array((size_t)max_threads, sizeof(*threads));
+    WorkerContext *contexts = checked_malloc_array((size_t)max_threads, sizeof(*contexts));
+    int started_threads = 0;
+
     const numeric seed = 1;
     if (!check_exists_and_add(seed)) {
         PRINT_U(seed);
-        push_stack(seed);
+        push_work(0, seed);
     }
 
-    const int max_threads = get_num_threads_from_args(argc, argv);
-    pthread_t *threads = checked_malloc_array((size_t)max_threads, sizeof(*threads));
-    int started_threads = 0;
-
     for (int i = 0; i < max_threads; i++) {
-        const int error = pthread_create(&threads[i], NULL, worker, NULL);
+        contexts[i].id = i;
+        const int error = pthread_create(&threads[i], NULL, worker, &contexts[i]);
         if (error != 0) {
             stop_workers();
             for (int j = 0; j < started_threads; j++) {
@@ -280,12 +379,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    for (size_t i = 0; i < HASH_SIZE; i++) {
-        free(hash_table[i].array);
-        pthread_rwlock_destroy(&hash_table[i].lock);
+    for (int i = 0; i < queue_count; i++) {
+        queue_destroy(&queues[i]);
     }
-    free(hash_table);
-    free(stack);
+    concurrent_visited_destroy(&visited);
+    free(queues);
+    free(contexts);
     free(threads);
 
     return 0;

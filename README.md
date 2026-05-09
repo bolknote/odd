@@ -26,8 +26,8 @@ Two C programs share the same **mathematical meaning**, but not the same enginee
 
 | Program | Role |
 |--------|------|
-| **`phase1`** | Single-threaded enumerator. Simple queue/stack over an ordered array with binary-search insertion—easy to reason about, but effectively a small-width reference implementation. |
-| **`phase2`** | Multi-threaded enumerator with a sharded hash table (read/write locks per bucket) and a work-stealing-style stack protected by a mutex. Intended for larger domains, subject to memory and output-volume limits. |
+| **`phase1`** | Single-threaded enumerator. Simple stack-based worklist plus a bitset-backed visited set. |
+| **`phase2`** | Multi-threaded enumerator with an atomic bitset-backed visited set and per-thread work queues with work stealing. Intended for larger domains, subject to memory and output-volume limits. |
 
 Both programs print **one odd number per line** in hexadecimal (`0x…`), preceded by zero-padding to the selected fixed-width type (`uint16_t` prints four hex digits, `uint32_t` eight, `uint64_t` sixteen, `uint128_t` thirty-two). They only print a value when it is inserted into the set for the **first** time, so each line should be unique for a correct run.
 
@@ -37,6 +37,8 @@ The core closure step for each newly discovered $x$ is:
 2. If $x$ is divisible by $3$, enqueue $x/3$.
 
 Starting from seed $1$, this matches the inductive definition above **within the limits of your `numeric` type** (overflow stops a branch).
+
+For `uint16_t` and `uint32_t`, the visited set is a dense bitset over odd values (`x >> 1`). For `uint64_t` and `uint128_t`, it switches to sparse paged bitsets so the program only allocates pages it actually touches.
 
 ---
 
@@ -77,7 +79,8 @@ make fast NUMERIC_TYPE=uint16_t
 ```
 
 - **`uint16_t`** — small universe; runs finish quickly; good for regression checks (counts should match between `phase1` and `phase2`).
-- **`uint32_t`** — large universe; potentially **hundreds of millions of lines** of output, long runtimes, and multi-gigabyte memory use. Pipe to `wc -l` if you only care how many distinct values appear.
+- **`uint32_t`** — dense visited bitset uses about **256 MiB**; output can still be **hundreds of millions of lines**. Pipe to `wc -l` if you only care how many distinct values appear.
+- **`uint64_t` / `uint128_t`** — sparse paged visited bitsets avoid allocating the full universe, but long runs can still consume substantial memory as more pages are touched.
 
 ---
 
@@ -95,6 +98,6 @@ Optional first argument: worker count. If omitted, the program picks a default f
 ## Practical notes
 
 - **Determinism of the set:** For a fixed `NUMERIC_TYPE`, the **set** of emitted values should be the same regardless of thread count; only **print order** may differ in `phase2`.
-- **`phase1` scale:** `phase1` keeps a single sorted array and shifts elements on insert, so it is useful as a reference implementation for small widths rather than for full 32-bit runs.
+- **Visited-set representation:** `uint16_t`/`uint32_t` use dense bitsets; wider types use sparse paged bitsets.
 - **Counting output:** `wc -l` counts lines. For long jobs, redirect to a log file or use `nohup`/`tmux` so SSH disconnects do not lose your shell pipeline.
-- **Disk and memory:** Saving the full hex listing for a 32-bit run is **enormous**, and the in-memory visited set can also require many gigabytes. Prefer counting lines or hashing if you only need verification statistics.
+- **Disk and memory:** Saving the full hex listing for a 32-bit run is **enormous**. Prefer counting lines or hashing if you only need verification statistics.
