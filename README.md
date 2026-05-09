@@ -1,6 +1,100 @@
-x ∈ ℕ\
-1 ∈ X\
-3x ∈ X → x ∈ X\
-x ∈ X → 2x + 1 ∈ X
+# Odds — exploring a small inductive definition of odd numbers
 
-{2t + 1 | t ∈ ℕ } = X?
+This repository is a small **computational experiment** around a classic puzzle: define a set $X \subseteq \mathbb{N}$ by three rules, then ask whether $X$ coincides with **all positive odd integers**.
+
+The rules are deliberately minimal:
+
+$$
+\begin{aligned}
+&1 \in X \\
+&3x \in X \implies x \in X \\
+&x \in X \implies 2x + 1 \in X
+\end{aligned}
+$$
+
+Equivalently: start from $1$, repeatedly apply $x \mapsto 2x+1$, and whenever you see a multiple of three you may “pull back” one division by $3$. The **order in which you apply these moves does not change the set** they generate—the closure is fixed by the rules—but your **implementation** must respect that if you want parallel code to match sequential code.
+
+The open question (the one journal authors once threw at readers) is whether this inductive closure is exactly $\{\,2t+1 \mid t \in \mathbb{N}\,\}$. This code does **not** prove the theorem; it **enumerates** the elements that lie in the closure **inside a bounded numeric range** (determined by your chosen integer width), so you can stress hardware, compare implementations, and watch how far you can reach before you wrap, overflow, or simply run out of patience.
+
+For background in Russian, see [«Нечётные числа» on bolknote.ru](https://bolknote.ru/all/nechyotnye-chisla/).
+
+---
+
+## What is implemented here?
+
+Two C programs share the same **mathematical meaning**, but not the same engineering trade-offs:
+
+| Program | Role |
+|--------|------|
+| **`phase1`** | Single-threaded enumerator. Simple queue/stack over an ordered array with binary-search insertion—easy to reason about, but effectively a small-width reference implementation. |
+| **`phase2`** | Multi-threaded enumerator with a sharded hash table (read/write locks per bucket) and a work-stealing-style stack protected by a mutex. Intended for larger domains, subject to memory and output-volume limits. |
+
+Both programs print **one odd number per line** in hexadecimal (`0x…`), preceded by zero-padding to the selected fixed-width type (`uint16_t` prints four hex digits, `uint32_t` eight, `uint64_t` sixteen, `uint128_t` thirty-two). They only print a value when it is inserted into the set for the **first** time, so each line should be unique for a correct run.
+
+The core closure step for each newly discovered $x$ is:
+
+1. If $2x+1$ fits in the chosen type, enqueue it.
+2. If $x$ is divisible by $3$, enqueue $x/3$.
+
+Starting from seed $1$, this matches the inductive definition above **within the limits of your `numeric` type** (overflow stops a branch).
+
+---
+
+## Building
+
+Requires a C compiler with **`unsigned __int128`** (GCC/Clang on typical 64-bit Linux/macOS) or `_BitInt(128)` as a fallback. The code uses C11 features such as `_Generic`; MSVC is not a supported compiler target.
+
+Two profiles are defined in the `Makefile`:
+
+| Target | Binaries | Typical use |
+|--------|-----------|-------------|
+| **`make`** (default) | `phase1`, `phase2` | Development: strict warnings, `-O2`, stack protector, `_FORTIFY_SOURCE=2`. |
+| **`make fast`** | `phase1-fast`, `phase2-fast` | Long runs / benchmarking: `-O3`, **`-march=native`**, LTO; no fortify/stack-hardening overhead. |
+
+```bash
+make              # phase1 + phase2 (strict “dev” flags)
+make fast         # phase1-fast + phase2-fast (speed-oriented)
+make clean        # removes all four binaries
+```
+
+Tune the CPU architecture for the fast build if needed (default `MARCH=native`):
+
+```bash
+make fast MARCH=znver3    # example: explicit AMD Zen 3
+```
+
+`phase2` and `phase2-fast` are linked with **POSIX threads** (`-pthread`).
+
+---
+
+## Choosing the integer width (`NUMERIC_TYPE`)
+
+By default, both sources use `uint32_t`. Override it through the `Makefile`:
+
+```bash
+make NUMERIC_TYPE=uint16_t
+make fast NUMERIC_TYPE=uint16_t
+```
+
+- **`uint16_t`** — small universe; runs finish quickly; good for regression checks (counts should match between `phase1` and `phase2`).
+- **`uint32_t`** — large universe; potentially **hundreds of millions of lines** of output, long runtimes, and multi-gigabyte memory use. Pipe to `wc -l` if you only care how many distinct values appear.
+
+---
+
+## Running `phase2` with more than one thread
+
+Optional first argument: worker count. If omitted, the program picks a default from the OS (`sysconf(_SC_NPROCESSORS_ONLN)`). Explicit values must be integers in the range `1..1024`.
+
+```bash
+./phase2        # default thread count
+./phase2 8      # eight worker threads
+```
+
+---
+
+## Practical notes
+
+- **Determinism of the set:** For a fixed `NUMERIC_TYPE`, the **set** of emitted values should be the same regardless of thread count; only **print order** may differ in `phase2`.
+- **`phase1` scale:** `phase1` keeps a single sorted array and shifts elements on insert, so it is useful as a reference implementation for small widths rather than for full 32-bit runs.
+- **Counting output:** `wc -l` counts lines. For long jobs, redirect to a log file or use `nohup`/`tmux` so SSH disconnects do not lose your shell pipeline.
+- **Disk and memory:** Saving the full hex listing for a 32-bit run is **enormous**, and the in-memory visited set can also require many gigabytes. Prefer counting lines or hashing if you only need verification statistics.

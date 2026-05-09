@@ -1,3 +1,6 @@
 log
 phase1
 phase2
+phase1-fast
+phase2-fast
+*.d
