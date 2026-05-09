@@ -37,12 +37,22 @@ typedef struct {
 
 typedef struct {
     int id;
+    uintmax_t emitted_count;
 } WorkerContext;
 
 typedef struct {
     int thread_count;
     bool count_only;
 } AppConfig;
+
+typedef struct {
+    VisitedSet visited;
+    numeric *stack;
+    size_t stack_size;
+    size_t stack_capacity;
+    uintmax_t emitted_count;
+    bool count_only;
+} SingleThreadRun;
 
 static ConcurrentVisitedSet visited;
 static WorkQueue *queues = NULL;
@@ -52,8 +62,9 @@ static bool count_only = false;
 static pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_condition = PTHREAD_COND_INITIALIZER;
 
+static atomic_int sleeping_workers = 0;
 static atomic_size_t outstanding_work = 0;
-static _Atomic uintmax_t emitted_count = 0;
+static uintmax_t initial_emitted_count = 0;
 static atomic_bool running = true;
 
 static void die_pthread(int error, const char *message) {
@@ -73,6 +84,80 @@ static void unlock_mutex(pthread_mutex_t *mutex, const char *message) {
     if (error != 0) {
         die_pthread(error, message);
     }
+}
+
+static void single_emit_value(SingleThreadRun *run, numeric value) {
+    if (run->count_only) {
+        run->emitted_count++;
+    } else {
+        PRINT_U(value);
+    }
+}
+
+static bool single_check_exists_and_add(SingleThreadRun *run, numeric value) {
+    return visited_check_and_add(&run->visited, value);
+}
+
+static void single_push_stack(SingleThreadRun *run, numeric value) {
+    if (run->stack_size == run->stack_capacity) {
+        grow_numeric_array(&run->stack, &run->stack_capacity);
+    }
+
+    run->stack[run->stack_size++] = value;
+}
+
+static numeric single_pop_stack(SingleThreadRun *run) {
+    return run->stack[--run->stack_size];
+}
+
+static void single_add_next(SingleThreadRun *run, numeric value) {
+    if (!single_check_exists_and_add(run, value)) {
+        single_emit_value(run, value);
+        single_push_stack(run, value);
+    }
+}
+
+static void single_process_value(SingleThreadRun *run, numeric value) {
+    numeric next;
+    if (mul2_add1(value, &next)) {
+        single_add_next(run, next);
+    }
+
+    numeric divided;
+    if (divide_exact(value, 3, &divided)) {
+        single_add_next(run, divided);
+    }
+}
+
+static void run_single_threaded(bool should_count_only) {
+    SingleThreadRun run = {
+        .visited = {0},
+        .stack = NULL,
+        .stack_size = 0,
+        .stack_capacity = QUEUE_INITIAL_CAPACITY,
+        .emitted_count = 0,
+        .count_only = should_count_only,
+    };
+
+    visited_init(&run.visited);
+    run.stack = checked_malloc_array(run.stack_capacity, sizeof(*run.stack));
+
+    const numeric seed = 1;
+    if (!single_check_exists_and_add(&run, seed)) {
+        single_emit_value(&run, seed);
+        single_push_stack(&run, seed);
+    }
+
+    while (run.stack_size > 0) {
+        single_process_value(&run, single_pop_stack(&run));
+    }
+
+    if (run.count_only) {
+        print_count(run.emitted_count);
+    }
+
+    free(run.stack);
+    visited_destroy(&run.visited);
 }
 
 static void concurrent_visited_init(ConcurrentVisitedSet *set) {
@@ -131,7 +216,11 @@ static bool concurrent_visited_check_and_add(ConcurrentVisitedSet *set, numeric 
         const size_t bit_index = (size_t)odd_index;
         const size_t word_index = bit_index / BITSET_WORD_BITS;
         const uint64_t mask = UINT64_C(1) << (bit_index % BITSET_WORD_BITS);
-        const uint64_t previous = atomic_fetch_or(&set->dense_words[word_index], mask);
+        const uint64_t previous = atomic_fetch_or_explicit(
+            &set->dense_words[word_index],
+            mask,
+            memory_order_relaxed
+        );
 
         return (previous & mask) != 0;
     }
@@ -159,7 +248,11 @@ static bool concurrent_visited_check_and_add(ConcurrentVisitedSet *set, numeric 
 
     const size_t word_index = page_offset / BITSET_WORD_BITS;
     const uint64_t mask = UINT64_C(1) << (page_offset % BITSET_WORD_BITS);
-    const uint64_t previous = atomic_fetch_or(&page->words[word_index], mask);
+    const uint64_t previous = atomic_fetch_or_explicit(
+        &page->words[word_index],
+        mask,
+        memory_order_relaxed
+    );
 
     return (previous & mask) != 0;
 }
@@ -168,10 +261,14 @@ static bool check_exists_and_add(numeric v) {
     return concurrent_visited_check_and_add(&visited, v);
 }
 
-static void emit_value(numeric value) {
-    atomic_fetch_add(&emitted_count, 1);
-
-    if (!count_only) {
+static void emit_value(WorkerContext *context, numeric value) {
+    if (count_only) {
+        if (context == NULL) {
+            initial_emitted_count++;
+        } else {
+            context->emitted_count++;
+        }
+    } else {
         PRINT_U(value);
     }
 }
@@ -221,6 +318,10 @@ static bool queue_pop(WorkQueue *queue, numeric *value) {
 }
 
 static void signal_work_available(void) {
+    if (atomic_load_explicit(&sleeping_workers, memory_order_relaxed) == 0) {
+        return;
+    }
+
     lock_mutex(&work_mutex, "pthread_mutex_lock");
     const int error = pthread_cond_signal(&work_condition);
     if (error != 0) {
@@ -230,27 +331,27 @@ static void signal_work_available(void) {
 }
 
 static void push_work(int queue_id, numeric value) {
-    atomic_fetch_add(&outstanding_work, 1);
+    atomic_fetch_add_explicit(&outstanding_work, 1, memory_order_relaxed);
     queue_push(&queues[queue_id], value);
     signal_work_available();
 }
 
-static void add_next(int worker_id, numeric value) {
+static void add_next(WorkerContext *context, numeric value) {
     if (!check_exists_and_add(value)) {
-        emit_value(value);
-        push_work(worker_id, value);
+        emit_value(context, value);
+        push_work(context->id, value);
     }
 }
 
-static void process_value(int worker_id, numeric value) {
+static void process_value(WorkerContext *context, numeric value) {
     numeric next;
     if (mul2_add1(value, &next)) {
-        add_next(worker_id, next);
+        add_next(context, next);
     }
 
     numeric divided;
     if (divide_exact(value, 3, &divided)) {
-        add_next(worker_id, divided);
+        add_next(context, divided);
     }
 }
 
@@ -276,13 +377,15 @@ static bool wait_for_work(int worker_id, numeric *item) {
     }
 
     lock_mutex(&work_mutex, "pthread_mutex_lock");
-    while (atomic_load(&running)) {
+    while (atomic_load_explicit(&running, memory_order_relaxed)) {
         if (try_get_work(worker_id, item)) {
             unlock_mutex(&work_mutex, "pthread_mutex_unlock");
             return true;
         }
 
+        atomic_fetch_add_explicit(&sleeping_workers, 1, memory_order_relaxed);
         const int error = pthread_cond_wait(&work_condition, &work_mutex);
+        atomic_fetch_sub_explicit(&sleeping_workers, 1, memory_order_relaxed);
         if (error != 0) {
             die_pthread(error, "pthread_cond_wait");
         }
@@ -293,8 +396,8 @@ static bool wait_for_work(int worker_id, numeric *item) {
 }
 
 static void finish_work_item(void) {
-    if (atomic_fetch_sub(&outstanding_work, 1) == 1) {
-        atomic_store(&running, false);
+    if (atomic_fetch_sub_explicit(&outstanding_work, 1, memory_order_relaxed) == 1) {
+        atomic_store_explicit(&running, false, memory_order_relaxed);
 
         lock_mutex(&work_mutex, "pthread_mutex_lock");
         const int error = pthread_cond_broadcast(&work_condition);
@@ -306,12 +409,12 @@ static void finish_work_item(void) {
 }
 
 static void *worker(void *arg) {
-    const WorkerContext *context = arg;
+    WorkerContext *context = arg;
     const int worker_id = context->id;
     numeric item;
 
     while (wait_for_work(worker_id, &item)) {
-        process_value(worker_id, item);
+        process_value(context, item);
         finish_work_item();
     }
 
@@ -364,7 +467,7 @@ static AppConfig parse_args(int argc, char *argv[]) {
 }
 
 static void stop_workers(void) {
-    atomic_store(&running, false);
+    atomic_store_explicit(&running, false, memory_order_relaxed);
 
     lock_mutex(&work_mutex, "pthread_mutex_lock");
     const int error = pthread_cond_broadcast(&work_condition);
@@ -376,6 +479,12 @@ static void stop_workers(void) {
 
 int main(int argc, char *argv[]) {
     const AppConfig config = parse_args(argc, argv);
+    if (config.thread_count == 1) {
+        configure_stdout();
+        run_single_threaded(config.count_only);
+        return 0;
+    }
+
     count_only = config.count_only;
 
     configure_stdout();
@@ -389,12 +498,12 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_t *threads = checked_malloc_array((size_t)max_threads, sizeof(*threads));
-    WorkerContext *contexts = checked_malloc_array((size_t)max_threads, sizeof(*contexts));
+    WorkerContext *contexts = checked_calloc_array((size_t)max_threads, sizeof(*contexts));
     int started_threads = 0;
 
     const numeric seed = 1;
     if (!check_exists_and_add(seed)) {
-        emit_value(seed);
+        emit_value(NULL, seed);
         push_work(0, seed);
     }
 
@@ -421,6 +530,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (count_only) {
+        uintmax_t total_count = initial_emitted_count;
+        for (int i = 0; i < max_threads; i++) {
+            total_count += contexts[i].emitted_count;
+        }
+        print_count(total_count);
+    }
+
     for (int i = 0; i < queue_count; i++) {
         queue_destroy(&queues[i]);
     }
@@ -428,10 +545,6 @@ int main(int argc, char *argv[]) {
     free(queues);
     free(contexts);
     free(threads);
-
-    if (count_only) {
-        print_count(atomic_load(&emitted_count));
-    }
 
     return 0;
 }
