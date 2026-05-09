@@ -39,14 +39,21 @@ typedef struct {
     int id;
 } WorkerContext;
 
+typedef struct {
+    int thread_count;
+    bool count_only;
+} AppConfig;
+
 static ConcurrentVisitedSet visited;
 static WorkQueue *queues = NULL;
 static int queue_count = 0;
+static bool count_only = false;
 
 static pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_condition = PTHREAD_COND_INITIALIZER;
 
 static atomic_size_t outstanding_work = 0;
+static _Atomic uintmax_t emitted_count = 0;
 static atomic_bool running = true;
 
 static void die_pthread(int error, const char *message) {
@@ -161,6 +168,14 @@ static bool check_exists_and_add(numeric v) {
     return concurrent_visited_check_and_add(&visited, v);
 }
 
+static void emit_value(numeric value) {
+    atomic_fetch_add(&emitted_count, 1);
+
+    if (!count_only) {
+        PRINT_U(value);
+    }
+}
+
 static void queue_init(WorkQueue *queue) {
     queue->capacity = QUEUE_INITIAL_CAPACITY;
     queue->size = 0;
@@ -222,7 +237,7 @@ static void push_work(int queue_id, numeric value) {
 
 static void add_next(int worker_id, numeric value) {
     if (!check_exists_and_add(value)) {
-        PRINT_U(value);
+        emit_value(value);
         push_work(worker_id, value);
     }
 }
@@ -303,25 +318,49 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-static int get_num_threads_from_args(int argc, char *argv[]) {
-    if (argc > 1) {
-        char *end = NULL;
-        errno = 0;
-        const long requested = strtol(argv[1], &end, 10);
-
-        if (errno != 0 || end == argv[1] || *end != '\0' || requested <= 0 || requested > MAX_THREADS) {
-            die_message("thread count must be an integer in the range 1..1024");
-        }
-
-        return (int)requested;
-    }
-
+static int default_thread_count(void) {
     const long online = sysconf(_SC_NPROCESSORS_ONLN);
     if (online <= 0) {
         return 1;
     }
 
     return online > MAX_THREADS ? MAX_THREADS : (int)online;
+}
+
+static int parse_thread_count(const char *arg) {
+    char *end = NULL;
+    errno = 0;
+    const long requested = strtol(arg, &end, 10);
+
+    if (errno != 0 || end == arg || *end != '\0' || requested <= 0 || requested > MAX_THREADS) {
+        die_message("thread count must be an integer in the range 1..1024");
+    }
+
+    return (int)requested;
+}
+
+static AppConfig parse_args(int argc, char *argv[]) {
+    AppConfig config = {
+        .thread_count = default_thread_count(),
+        .count_only = false,
+    };
+    bool has_thread_count = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--count") == 0) {
+            config.count_only = true;
+            continue;
+        }
+
+        if (has_thread_count) {
+            die_message("usage: phase2 [thread-count] [--count]");
+        }
+
+        config.thread_count = parse_thread_count(argv[i]);
+        has_thread_count = true;
+    }
+
+    return config;
 }
 
 static void stop_workers(void) {
@@ -336,10 +375,13 @@ static void stop_workers(void) {
 }
 
 int main(int argc, char *argv[]) {
+    const AppConfig config = parse_args(argc, argv);
+    count_only = config.count_only;
+
     configure_stdout();
     concurrent_visited_init(&visited);
 
-    const int max_threads = get_num_threads_from_args(argc, argv);
+    const int max_threads = config.thread_count;
     queue_count = max_threads;
     queues = checked_malloc_array((size_t)queue_count, sizeof(*queues));
     for (int i = 0; i < queue_count; i++) {
@@ -352,7 +394,7 @@ int main(int argc, char *argv[]) {
 
     const numeric seed = 1;
     if (!check_exists_and_add(seed)) {
-        PRINT_U(seed);
+        emit_value(seed);
         push_work(0, seed);
     }
 
@@ -386,6 +428,10 @@ int main(int argc, char *argv[]) {
     free(queues);
     free(contexts);
     free(threads);
+
+    if (count_only) {
+        print_count(atomic_load(&emitted_count));
+    }
 
     return 0;
 }

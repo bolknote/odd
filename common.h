@@ -220,6 +220,10 @@ static ODDS_UNUSED void configure_stdout(void) {
     (void)setvbuf(stdout, NULL, _IOFBF, 1024 * 1024);
 }
 
+static ODDS_UNUSED void print_count(uintmax_t count) {
+    printf("%" PRIuMAX "\n", count);
+}
+
 static ODDS_UNUSED void print_u128(const uint128_t v) {
     const uint64_t high = (uint64_t)(v >> 64);
     const uint64_t low = (uint64_t)v;

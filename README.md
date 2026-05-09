@@ -31,6 +31,8 @@ Two C programs share the same **mathematical meaning**, but not the same enginee
 
 Both programs print **one odd number per line** in hexadecimal (`0x…`), preceded by zero-padding to the selected fixed-width type (`uint16_t` prints four hex digits, `uint32_t` eight, `uint64_t` sixteen, `uint128_t` thirty-two). They only print a value when it is inserted into the set for the **first** time, so each line should be unique for a correct run.
 
+Pass **`--count`** to suppress per-value output and print only the final number of discovered values. This is the fastest way to measure enumeration throughput without benchmarking the terminal or pipe.
+
 The core closure step for each newly discovered $x$ is:
 
 1. If $2x+1$ fits in the chosen type, enqueue it.
@@ -89,8 +91,11 @@ make fast NUMERIC_TYPE=uint16_t
 Optional first argument: worker count. If omitted, the program picks a default from the OS (`sysconf(_SC_NPROCESSORS_ONLN)`). Explicit values must be integers in the range `1..1024`.
 
 ```bash
-./phase2        # default thread count
-./phase2 8      # eight worker threads
+./phase1 --count      # single-threaded count-only run
+./phase2              # default thread count
+./phase2 8            # eight worker threads
+./phase2 --count      # default thread count, print only the final count
+./phase2 8 --count    # eight worker threads, print only the final count
 ```
 
 ---
@@ -99,5 +104,5 @@ Optional first argument: worker count. If omitted, the program picks a default f
 
 - **Determinism of the set:** For a fixed `NUMERIC_TYPE`, the **set** of emitted values should be the same regardless of thread count; only **print order** may differ in `phase2`.
 - **Visited-set representation:** `uint16_t`/`uint32_t` use dense bitsets; wider types use sparse paged bitsets.
-- **Counting output:** `wc -l` counts lines. For long jobs, redirect to a log file or use `nohup`/`tmux` so SSH disconnects do not lose your shell pipeline.
+- **Counting output:** Use `--count` when you only need the number of discovered values. `wc -l` also counts lines, but then the program still formats and writes every value.
 - **Disk and memory:** Saving the full hex listing for a 32-bit run is **enormous**. Prefer counting lines or hashing if you only need verification statistics.
